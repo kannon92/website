@@ -60,38 +60,14 @@ If you leave `scheduling` out entirely, the Job controller defaults to `Basic`, 
 
 KEP-6089 leaves the actual `JobSet` integration to the JobSet project, and that work is underway as its own [KEP](https://github.com/kubernetes-sigs/jobset/tree/main/keps/969-WAS-integration), behind a new `WorkloadAwareScheduling` feature gate. It lands as an optional `spec.scheduling` field on `JobSetSpec`, and it's fully opt-in: a JobSet that doesn't set it creates no `Workload` or `PodGroup` objects at all, and behaves exactly as it does today.
 
-Of the two reference shapes KEP-6089 sketches out, JobSet picked the centralized "Targeted Policies" model over template delegation. All scheduling configuration, whether it applies to the whole JobSet or to a single `ReplicatedJob`, lives in one place at the root, and per-replica overrides target a `ReplicatedJob` by name through `replicatedJobPolicies`. That mirrors the `targetReplicatedJobs` pattern JobSet users already know from `FailurePolicy` and `SuccessPolicy`, and it avoids splitting scheduling intent between the root spec and the nested Job template, which also means JobSet doesn't have to wait on `Job` to ship its own `spec.scheduling` field first.
-
-```yaml
-apiVersion: jobset.x-k8s.io/v1alpha2
-kind: JobSet
-metadata:
-  name: rdma-training
-spec:
-  scheduling:
-    policy:
-      gang: {}
-    replicatedJobPolicies:
-      - targetReplicatedJob: "driver"
-        policy:
-          basic: {}
-      - targetReplicatedJob: "workers"
-        constraints:
-          topology:
-            - level: "topology.kubernetes.io/rack"
-        disruption:
-          all: {}
-  replicatedJobs:
-    - name: driver
-      replicas: 1
-      # ...
-    - name: workers
-      replicas: 16
-      # ...
-```
-
-Here the driver opts back out to `basic` scheduling and schedules independently, while the workers inherit the composite `gang` default, get pinned to the same rack, and are disrupted as a unit. When there's nothing to target and no sequencing involved, the controller compiles a single `Workload` for the whole JobSet and defaults its `gang.minCount` to the sum of `parallelism × replicas` across every `ReplicatedJob`. As soon as a `dependsOn` or `InOrder` `startupPolicy` is in play, though, one top-level `PodGroup` would deadlock, since not every pod exists yet when the first one needs to be admitted. The controller detects that and automatically falls back to a `PodGroup` per `ReplicatedJob` instead, each sized to its own `parallelism × replicas`.
-
 Under the hood, JobSet maps each compiled group to a `workloadbuilder.WorkloadItem` and calls `BuildWorkload`, the same as `Job` does. The library doesn't yet support a real composite/leaf parent-child tree, so in the per-`ReplicatedJob` case JobSet builds one `Workload` per item and merges their `PodGroupTemplates` together before creating the object. Once the `Workload` exists, the controller stamps each child `Job` with the `scheduling.k8s.io/group-template-name` and `scheduling.k8s.io/parent-composite-podgroup` annotations from KEP-6089's downward mapping convention, and sets `pod.spec.schedulingGroup.podGroupName` so pods land in the right `PodGroup`. It's centralized management for this alpha: JobSet owns the `Workload` and every `PodGroup` it produces, and the child `Job` controllers see the `JobSet` owner reference and skip creating their own.
 
 The scheduling objects also track the JobSet's lifecycle rather than sitting there statically. Suspending a JobSet deletes its `Workload` and `PodGroup`s so the scheduler stops holding a reservation for pods that aren't running, and resuming recreates them. Because both objects are immutable once created, scaling an `ElasticJobSet`'s parallelism means the controller has to delete and recreate them with the new `minCount` rather than patching in place.
+
+## Future Work
+
+The goal of WAS is to improve the experience of scheduling multi-node workloads on Kubernetes.
+Job and JobSet are two of many APIs we hope to bring WAS too.
+We hope to bring WAS to popular workload APIs like Leader Worker Set, Deployment, StatefulSets, KubeRay, Spark and TrainJob.
+The workload builder library provides an integration point for future controllers and we aim to have a standard
+representation for scheduling to pave the way for clear scheduling requirements.
